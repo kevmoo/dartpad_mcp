@@ -32,8 +32,16 @@ dart /tmp/dartpad_mcp.dart
 
 ## Connecting a DartPad Preview Tab
 
-1. Click **Connect Agent** in DartPad Preview's top bar (or append
-   `?mcp_port=8787` to the URL in Chrome).
+1. Open [dartpad-webmcp.web.app/?s=3](https://dartpad-webmcp.web.app/?s=3) in
+   Chrome and click **Connect Agent** in the top bar (or append `?mcp_port=8787`
+   to the URL).
+   - **Browser prompt**: When an `https://` DartPad host connects to
+     `ws://127.0.0.1:8787/mcp-ws`, click **Allow** if Chrome prompts for Local
+     Network Access. Safari blocks `https://` pages from opening
+     `ws://127.0.0.1` loopback WebSockets.
+   - **Remote SSH hosts**: The browser dials `127.0.0.1` on the machine running
+     Chrome. If your coding agent runs over SSH on another host, forward the
+     bridge port (`ssh -L 8787:127.0.0.1:8787`).
 2. Verify the tab connected:
    ```bash
    dartpad_mcp status --require-tab
