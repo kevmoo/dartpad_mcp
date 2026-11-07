@@ -677,7 +677,6 @@ final class DartPadMcpBridge {
     }
     if (data.containsKey('id') &&
         (data.containsKey('result') || data.containsKey('error'))) {
-      tab.touch();
       final completer = tab.pendingRequests.remove('${data['id']}');
       if (completer != null && !completer.isCompleted) {
         completer.complete(data);
@@ -688,10 +687,7 @@ final class DartPadMcpBridge {
   void _handleTabHello(_BrowserTab tab, Map<String, Object?> data) {
     final params = _asObjectMap(data['params']);
     final url = '${params['url'] ?? tab.url}';
-    final rawSid = params['sessionId'];
-    final sid = rawSid != null && '$rawSid'.isNotEmpty
-        ? '$rawSid'
-        : _extractSessionIdFromUrl(url, 'tab-${tab.connId}');
+    final sid = _resolveHelloSessionId(tab, params['sessionId'], url);
     if (params['tools'] case final List<Object?> rawTools) {
       final (:tools, :nativeSessionIdTools) = _augmentToolsForMcp(rawTools);
       tab
@@ -709,14 +705,26 @@ final class DartPadMcpBridge {
     _log(
       'Tab ready: conn=${tab.connId} sessionId=$sid tools=${tab.tools.length}',
     );
+    _sendSocketJson(tab, <String, Object?>{
+      'jsonrpc': '2.0',
+      'method': 'webmcp/welcome',
+      'params': <String, Object?>{'sessionId': sid},
+    });
     if (data['id'] case final Object id) {
       _sendSocketJson(tab, <String, Object?>{
         'jsonrpc': '2.0',
         'id': id,
-        'result': const <String, Object?>{'ok': true},
+        'result': <String, Object?>{'ok': true, 'sessionId': sid},
       });
     }
     _notifyTabChange();
+  }
+
+  String _resolveHelloSessionId(_BrowserTab tab, Object? rawSid, String url) {
+    if (rawSid != null && '$rawSid'.isNotEmpty) {
+      return '$rawSid';
+    }
+    return _extractSessionIdFromUrl(url, 'tab-${tab.connId}');
   }
 
   void _onSocketClosed(_BrowserTab tab) {
@@ -750,12 +758,15 @@ final class DartPadMcpBridge {
   Future<Map<String, Object?>> _sendTabRpc(
     _BrowserTab tab,
     String method,
-    Map<String, Object?> params,
-  ) async {
+    Map<String, Object?> params, {
+    bool touchTab = true,
+  }) async {
     final rpcId = 'req-${++_nextRpcSeq}';
     final completer = Completer<Map<String, Object?>>();
     tab.pendingRequests[rpcId] = completer;
-    tab.touch();
+    if (touchTab) {
+      tab.touch();
+    }
     _sendSocketJson(tab, <String, Object?>{
       'jsonrpc': '2.0',
       'id': rpcId,
@@ -878,18 +889,25 @@ final class DartPadMcpBridge {
     }
     tab ??= await _waitForTab(requestedSid);
     if (tab != null) {
-      final liveTools = await _queryTabTools(tab);
+      final liveTools = await _queryTabTools(
+        tab,
+        touchTab: requestedSid == null,
+      );
       return _rpcResult(reqId, <String, Object?>{'tools': liveTools});
     }
     return _rpcResult(reqId, <String, Object?>{'tools': _cachedTools});
   }
 
-  Future<List<Map<String, Object?>>> _queryTabTools(_BrowserTab tab) async {
+  Future<List<Map<String, Object?>>> _queryTabTools(
+    _BrowserTab tab, {
+    required bool touchTab,
+  }) async {
     try {
       final wsResp = await _sendTabRpc(
         tab,
         'tools/list',
         const <String, Object?>{},
+        touchTab: touchTab,
       );
       final res = _asObjectMap(wsResp['result']);
       if (res['tools'] case final List<Object?> rawTools) {
@@ -941,7 +959,13 @@ final class DartPadMcpBridge {
     if (!tab.nativeSessionIdTools.contains(name)) {
       callArgs.remove('sessionId');
     }
-    return _invokeTabTool(reqId, tab, name, callArgs);
+    return _invokeTabTool(
+      reqId,
+      tab,
+      name,
+      callArgs,
+      touchTab: requestedSid == null,
+    );
   }
 
   Map<String, Object?> _missingTabResult(String? requestedSid) {
@@ -957,14 +981,15 @@ final class DartPadMcpBridge {
     Object? reqId,
     _BrowserTab tab,
     String name,
-    Map<String, Object?> callArgs,
-  ) async {
+    Map<String, Object?> callArgs, {
+    required bool touchTab,
+  }) async {
     final Map<String, Object?> wsResp;
     try {
       wsResp = await _sendTabRpc(tab, 'tools/call', <String, Object?>{
         'name': name,
         'arguments': callArgs,
-      });
+      }, touchTab: touchTab);
     } on TimeoutException {
       final sec = (callTimeout.inMilliseconds / 1000).toStringAsFixed(1);
       return _rpcResult(
@@ -1201,7 +1226,8 @@ Future<void> _dispatchStdioMessage(
   try {
     decoded = jsonDecode(rawMessage);
   } on FormatException catch (error) {
-    out.writeln(
+    _writeSafe(
+      out,
       jsonEncode(_rpcError(null, -32700, 'Parse error: ${error.message}')),
     );
     return;
@@ -1209,14 +1235,17 @@ Future<void> _dispatchStdioMessage(
   try {
     final response = await handler(decoded);
     if (response != null) {
-      out.writeln(jsonEncode(response));
+      _writeSafe(out, jsonEncode(response));
     }
   } catch (error) {
     if (decoded is Map<String, Object?> && !decoded.containsKey('id')) {
       return;
     }
     final reqId = decoded is Map<String, Object?> ? decoded['id'] : null;
-    out.writeln(jsonEncode(_rpcError(reqId, -32603, 'Internal error: $error')));
+    _writeSafe(
+      out,
+      jsonEncode(_rpcError(reqId, -32603, 'Internal error: $error')),
+    );
   }
 }
 
@@ -1331,27 +1360,34 @@ Future<int> runDartPadMcpCli(
   }
 
   if (config.showHelp) {
-    outSink.write(_usageText);
+    _writeSafe(outSink, _usageText, newline: false);
     return 0;
   }
 
-  return switch (config.subcommand) {
-    BridgeSubcommand.status => _runStatusCommand(config, outSink, errSink),
-    BridgeSubcommand.tools => _runToolsCommand(config, outSink, errSink),
-    BridgeSubcommand.call => _runCallCommand(
-      config,
-      inStream,
-      outSink,
-      errSink,
-    ),
-    BridgeSubcommand.serve => _runServeCommand(
-      config,
-      inStream,
-      outSink,
-      errSink,
-      stopSignal,
-    ),
-  };
+  try {
+    return await switch (config.subcommand) {
+      BridgeSubcommand.status => _runStatusCommand(config, outSink, errSink),
+      BridgeSubcommand.tools => _runToolsCommand(config, outSink, errSink),
+      BridgeSubcommand.call => _runCallCommand(
+        config,
+        inStream,
+        outSink,
+        errSink,
+      ),
+      BridgeSubcommand.serve => _runServeCommand(
+        config,
+        inStream,
+        outSink,
+        errSink,
+        stopSignal,
+      ),
+    };
+  } on IOException catch (error) {
+    if (_isBrokenPipeError(error)) {
+      return 0;
+    }
+    rethrow;
+  }
 }
 
 Future<int> _runStatusCommand(
@@ -1366,7 +1402,7 @@ Future<int> _runStatusCommand(
     );
     return 1;
   }
-  out.writeln(const JsonEncoder.withIndent('  ').convert(health));
+  _writeSafe(out, const JsonEncoder.withIndent('  ').convert(health));
   final tabs = health['connectedTabs'];
   if (config.requireTab && (tabs is! List<Object?> || tabs.isEmpty)) {
     return 2;
@@ -1470,8 +1506,47 @@ int _printCliRpcOutcome(Object? resp, StringSink out, StringSink err) {
       result is Map<String, Object?> && result.containsKey('structuredContent')
       ? result['structuredContent']
       : result;
-  out.writeln(const JsonEncoder.withIndent('  ').convert(payload));
+  _writeSafe(out, const JsonEncoder.withIndent('  ').convert(payload));
   return 0;
+}
+
+/// Returns `true` when [error] represents a closed consumer pipe (`EPIPE`).
+bool isBrokenPipeError(Object error) {
+  final osCode = switch (error) {
+    SocketException(:final osError?) => osError.errorCode,
+    FileSystemException(:final osError?) => osError.errorCode,
+    _ => null,
+  };
+  if (osCode == 32 || osCode == 232) {
+    return true;
+  }
+  return '$error'.toLowerCase().contains('broken pipe');
+}
+
+bool _isBrokenPipeError(Object error) => isBrokenPipeError(error);
+
+void _writeSafe(StringSink sink, String text, {bool newline = true}) {
+  try {
+    if (newline) {
+      sink.writeln(text);
+    } else {
+      sink.write(text);
+    }
+  } on IOException catch (error) {
+    if (!_isBrokenPipeError(error)) {
+      rethrow;
+    }
+  }
+}
+
+Future<void> _flushSafe(IOSink sink) async {
+  try {
+    await sink.flush();
+  } on IOException catch (error) {
+    if (!_isBrokenPipeError(error)) {
+      rethrow;
+    }
+  }
 }
 
 Future<int> _runServeCommand(
@@ -1578,9 +1653,11 @@ Future<void> _waitForProcessTermination() async {
 }
 
 Future<void> main(List<String> args) async {
+  unawaited(stdout.done.catchError((Object _) {}, test: isBrokenPipeError));
+  unawaited(stderr.done.catchError((Object _) {}, test: isBrokenPipeError));
   final code = await runDartPadMcpCli(args);
-  await stdout.flush();
-  await stderr.flush();
+  await _flushSafe(stdout);
+  await _flushSafe(stderr);
   if (code != 0) {
     exitCode = code;
   }

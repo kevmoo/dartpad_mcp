@@ -11,17 +11,44 @@ import 'package:test/scaffolding.dart';
 
 import '../bin/dartpad_mcp.dart';
 
+final class _BrokenPipeSink implements StringSink {
+  const _BrokenPipeSink();
+
+  Never _throwBrokenPipe() {
+    throw const FileSystemException(
+      'writeFrom failed',
+      '',
+      OSError('Broken pipe', 32),
+    );
+  }
+
+  @override
+  void write(Object? object) => _throwBrokenPipe();
+
+  @override
+  void writeAll(Iterable<dynamic> objects, [String separator = '']) =>
+      _throwBrokenPipe();
+
+  @override
+  void writeCharCode(int charCode) => _throwBrokenPipe();
+
+  @override
+  void writeln([Object? object = '']) => _throwBrokenPipe();
+}
+
 final class _FakeTab {
   _FakeTab(this.socket);
 
   final WebSocket socket;
+  final Completer<String> welcomeSessionId = Completer<String>();
   late final StreamSubscription<Object?> _sub;
 
   static Future<_FakeTab> connect({
     required int port,
-    required String sessionId,
+    required String? sessionId,
     required Map<String, FutureOr<Object?> Function(Map<String, Object?>)>
     handlers,
+    String? url,
     List<Map<String, Object?>>? customTools,
   }) async {
     final ws = await WebSocket.connect('ws://127.0.0.1:$port/mcp-ws');
@@ -46,7 +73,11 @@ final class _FakeTab {
         'method': 'webmcp/hello',
         'params': <String, Object?>{
           'sessionId': sessionId,
-          'url': 'https://preview.dartpad.dev/?s=$sessionId',
+          'url':
+              url ??
+              (sessionId == null
+                  ? 'https://preview.dartpad.dev/?mcp_port=$port'
+                  : 'https://preview.dartpad.dev/?s=$sessionId'),
           'tools': tools,
         },
       }),
@@ -54,8 +85,16 @@ final class _FakeTab {
 
     fake._sub = ws.listen((raw) async {
       final msg = jsonDecode(raw as String) as Map<String, Object?>;
-      final id = msg['id'];
       final method = msg['method'];
+      if (method == 'webmcp/welcome') {
+        final params = msg['params'] as Map<String, Object?>?;
+        final assigned = params?['sessionId'];
+        if (assigned is String && !fake.welcomeSessionId.isCompleted) {
+          fake.welcomeSessionId.complete(assigned);
+        }
+        return;
+      }
+      final id = msg['id'];
       if (id == null || method is! String) {
         return;
       }
@@ -311,7 +350,8 @@ void main() {
               as Map<String, Object?>)['tab'],
         ).equals('2');
 
-        // Explicit `sessionId: "1"` routes to tab 1.
+        // Explicit `sessionId: "1"` routes to tab 1 WITHOUT flipping the
+        // untargeted active default away from tab 2.
         final targetedCall =
             await postMcpHttp(mcpUri, const <String, Object?>{
                   'jsonrpc': '2.0',
@@ -328,9 +368,39 @@ void main() {
               as Map<String, Object?>)['tab'],
         ).equals('1');
 
-        // Close both tabs and confirm `tools/list` still serves cached schemas.
+        final defaultAfterTargeted =
+            await postMcpHttp(mcpUri, const <String, Object?>{
+                  'jsonrpc': '2.0',
+                  'id': 41,
+                  'method': 'tools/call',
+                  'params': <String, Object?>{'name': 'dartpad_get_status'},
+                })
+                as Map<String, Object?>;
+        check(
+          ((defaultAfterTargeted['result']
+                  as Map<String, Object?>)['structuredContent']
+              as Map<String, Object?>)['tab'],
+        ).equals('2');
+
+        // A tab connecting without `?s=` receives its assigned `tab-<connId>`
+        // via `webmcp/welcome`.
+        final bareTab = await _FakeTab.connect(
+          port: bridge.port,
+          sessionId: null,
+          handlers: <String, FutureOr<Object?> Function(Map<String, Object?>)>{
+            'dartpad_get_status': (args) => <String, Object?>{'tab': 'bare'},
+          },
+        );
+        addTearDown(bareTab.close);
+        final welcomedSid = await bareTab.welcomeSessionId.future.timeout(
+          const Duration(seconds: 2),
+        );
+        check(welcomedSid).equals('tab-3');
+
+        // Close all tabs and confirm `tools/list` still serves cached schemas.
         await tab1.close();
         await tab2.close();
+        await bareTab.close();
         await _waitForConnectedCount(bridge, 0);
 
         final cachedList =
@@ -427,6 +497,27 @@ void main() {
         final stdioResp =
             jsonDecode(stdioOut.toString().trim()) as Map<String, Object?>;
         check(stdioResp['id']).equals(99);
+
+        // Broken consumer pipes (`EPIPE`, errno 32) exit 0 cleanly instead of
+        // crashing with an unhandled FileSystemException.
+        for (final cliArgs in <List<String>>[
+          <String>['--help'],
+          <String>['status', '--port', '${bridge.port}'],
+          <String>[
+            'call',
+            'dartpad_write_files',
+            '{"note":"epipe"}',
+            '--port',
+            '${bridge.port}',
+          ],
+        ]) {
+          final epipeCode = await runDartPadMcpCli(
+            cliArgs,
+            out: const _BrokenPipeSink(),
+            err: StringBuffer(),
+          );
+          check(epipeCode).equals(0);
+        }
       },
     );
 
@@ -448,6 +539,18 @@ void main() {
         ], workingDirectory: tempDir.path);
         check(result.exitCode).equals(0);
         check('${result.stdout}').contains('dartpad_mcp call');
+
+        // Real OS broken-pipe (`EPIPE` on `dart:io` `stdout`) exits 0 cleanly
+        // when a downstream pipe consumer (`jq`, `head`) closes stdout early.
+        final proc = await Process.start(Platform.resolvedExecutable, <String>[
+          isolatedScript.path,
+          '--help',
+        ], workingDirectory: tempDir.path);
+        await proc.stdout.listen((_) {}).cancel();
+        final stderrText = await utf8.decoder.bind(proc.stderr).join();
+        final pipedExit = await proc.exitCode;
+        check(pipedExit).equals(0);
+        check(stderrText).not((it) => it.contains('FileSystemException'));
       },
     );
   });
