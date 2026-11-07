@@ -318,7 +318,6 @@ final class _BrowserTab {
   Set<String> nativeSessionIdTools = const <String>{};
   final Map<String, Completer<Map<String, Object?>>> pendingRequests =
       <String, Completer<Map<String, Object?>>>{};
-  StreamSubscription<Object?>? subscription;
 
   void touch() {
     lastActiveAt = DateTime.now();
@@ -454,8 +453,6 @@ final class DartPadMcpBridge {
 
   Future<void> _closeTab(_BrowserTab tab) async {
     tab.closed = true;
-    await tab.subscription?.cancel();
-    tab.subscription = null;
     _failPendingRequests(tab);
     try {
       await tab.socket.close(WebSocketStatus.normalClosure);
@@ -628,15 +625,19 @@ final class DartPadMcpBridge {
     final tab = _BrowserTab(connId: ++_nextConnId, socket: socket, peer: peer);
     _tabs[tab.connId] = tab;
     _log('Tab connected: conn=${tab.connId} peer=$peer');
-    // Cancelled in `_closeTab` and `_onSocketClosed`.
-    // ignore: cancel_subscriptions
-    final sub = socket.listen(
-      (event) => _onSocketEvent(tab, event),
-      onError: (_) => _onSocketClosed(tab),
-      onDone: () => _onSocketClosed(tab),
-      cancelOnError: true,
-    );
-    tab.subscription = sub;
+    unawaited(_pumpTabSocket(tab));
+  }
+
+  Future<void> _pumpTabSocket(_BrowserTab tab) async {
+    try {
+      await for (final rawEvent in tab.socket) {
+        _onSocketEvent(tab, rawEvent);
+      }
+    } catch (_) {
+      // Treat transport errors as socket closure.
+    } finally {
+      _onSocketClosed(tab);
+    }
   }
 
   void _onSocketEvent(_BrowserTab tab, Object? rawEvent) {
@@ -723,8 +724,6 @@ final class DartPadMcpBridge {
       return;
     }
     tab.closed = true;
-    unawaited(tab.subscription?.cancel());
-    tab.subscription = null;
     _failPendingRequests(tab);
     _log('Tab disconnected: conn=${tab.connId} sessionId=${tab.sessionId}');
     _notifyTabChange();
