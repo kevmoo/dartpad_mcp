@@ -36,6 +36,54 @@ final class _BrokenPipeSink implements StringSink {
   void writeln([Object? object = '']) => _throwBrokenPipe();
 }
 
+final class _LineNotificationSink implements StringSink {
+  _LineNotificationSink(this._lines);
+
+  final StreamController<String> _lines;
+  final StringBuffer _pending = StringBuffer();
+
+  @override
+  void write(Object? object) {
+    _pending.write(object);
+    _flushLines();
+  }
+
+  @override
+  void writeAll(Iterable<dynamic> objects, [String separator = '']) {
+    _pending.writeAll(objects, separator);
+    _flushLines();
+  }
+
+  @override
+  void writeCharCode(int charCode) {
+    _pending.writeCharCode(charCode);
+    _flushLines();
+  }
+
+  @override
+  void writeln([Object? object = '']) {
+    _pending.writeln(object);
+    _flushLines();
+  }
+
+  void _flushLines() {
+    final full = _pending.toString();
+    final parts = full.split('\n');
+    if (parts.length <= 1) {
+      return;
+    }
+    for (var i = 0; i < parts.length - 1; i++) {
+      final line = parts[i].trim();
+      if (line.isNotEmpty && !_lines.isClosed) {
+        _lines.add(line);
+      }
+    }
+    _pending
+      ..clear()
+      ..write(parts.last);
+  }
+}
+
 final class _FakeTab {
   _FakeTab(this.socket, this._tools);
 
@@ -178,7 +226,15 @@ void main() {
       check(defaultCfg.subcommand).equals(BridgeSubcommand.serve);
       check(defaultCfg.port).equals(defaultBridgePort);
       check(defaultCfg.host).equals('localhost');
+      check(defaultCfg.detach).isFalse();
       check(defaultCfg.stdio).isFalse();
+
+      final detachedCfg = parseBridgeCliArgs(const <String>[
+        '--detach',
+        '--port=0',
+      ]);
+      check(detachedCfg.detach).isTrue();
+      check(detachedCfg.port).equals(0);
 
       final custom = parseBridgeCliArgs(const <String>[
         'serve',
@@ -232,9 +288,40 @@ void main() {
         <String>['unknown-cmd'],
         <String>['call'],
         <String>['call', 'tool', '{}', '--stdin'],
+        <String>['--detach', '--stdio'],
+        <String>['status', '--detach'],
       ]) {
         check(() => parseBridgeCliArgs(badArgs)).throws<CliUsageException>();
       }
+    });
+
+    test('resolveSelfInvocation distinguishes AOT binaries from Dart VM', () {
+      final aotUnix = resolveSelfInvocation(
+        resolvedExecutable: '/opt/dart/app-bundles/dartpad_mcp/bin/dartpad_mcp',
+        scriptUri: Uri.file('/tmp/ignored.dart'),
+      );
+      check(
+        aotUnix.executable,
+      ).equals('/opt/dart/app-bundles/dartpad_mcp/bin/dartpad_mcp');
+      check(aotUnix.prefixArgs).isEmpty();
+
+      final aotWin = resolveSelfInvocation(
+        resolvedExecutable: r'C:\Users\dev\Dart\install\bin\dartpad_mcp.exe',
+        scriptUri: Uri.file('/tmp/ignored.dart'),
+      );
+      check(
+        aotWin.executable,
+      ).equals(r'C:\Users\dev\Dart\install\bin\dartpad_mcp.exe');
+      check(aotWin.prefixArgs).isEmpty();
+
+      final jitScript = resolveSelfInvocation(
+        resolvedExecutable: '/sdk/bin/dart',
+        scriptUri: Uri.file('/tmp/dartpad_mcp.dart'),
+      );
+      check(jitScript.executable).equals('/sdk/bin/dart');
+      check(
+        jitScript.prefixArgs,
+      ).deepEquals(const <String>['/tmp/dartpad_mcp.dart']);
     });
   });
 
@@ -302,6 +389,27 @@ void main() {
                 as Map<String, Object?>;
         final initResult = initResp['result'] as Map<String, Object?>;
         check(initResult['protocolVersion']).equals('2025-06-18');
+        final capabilities = initResult['capabilities'] as Map<String, Object?>;
+        check(
+          (capabilities['tools'] as Map<String, Object?>)['listChanged'],
+        ).equals(true);
+
+        // Cold unscoped `tools/list` returns the 9 baseline DartPad tools
+        // immediately without blocking for `waitTimeout` (3s).
+        final coldToolsSw = Stopwatch()..start();
+        final coldToolsResp =
+            await postMcpHttp(mcpUri, const <String, Object?>{
+                  'jsonrpc': '2.0',
+                  'id': 10,
+                  'method': 'tools/list',
+                })
+                as Map<String, Object?>;
+        coldToolsSw.stop();
+        check(coldToolsSw.elapsedMilliseconds).isLessThan(1000);
+        final coldTools =
+            (coldToolsResp['result'] as Map<String, Object?>)['tools']
+                as List<Object?>;
+        check(coldTools.length).equals(9);
 
         final notifResp = await postMcpHttp(mcpUri, const <String, Object?>{
           'jsonrpc': '2.0',
@@ -428,6 +536,118 @@ void main() {
             (cachedList['result'] as Map<String, Object?>)['tools']
                 as List<Object?>;
         check(tools).isNotEmpty();
+      },
+    );
+
+    test(
+      'evicts superseded clientTabId sockets on reconnect and pings dead peers',
+      () async {
+        final bridge = await DartPadMcpBridge.start(
+          port: 0,
+          pingInterval: const Duration(milliseconds: 60),
+        );
+        addTearDown(bridge.close);
+
+        // Connect initial socket for `tab-same`, then open a replacement socket
+        // with the same `clientTabId` without closing the old one first
+        // (simulating a half-open SSH tunnel reconnect or browser reload).
+        final staleTab = await _FakeTab.connect(
+          port: bridge.port,
+          sessionId: '1',
+          clientTabId: 'tab-same',
+          handlers: <String, FutureOr<Object?> Function(Map<String, Object?>)>{
+            'dartpad_get_status': (_) => <String, Object?>{'gen': 'stale'},
+          },
+        );
+        addTearDown(staleTab.close);
+        await _waitForConnectedCount(bridge, 1);
+
+        final freshTab = await _FakeTab.connect(
+          port: bridge.port,
+          sessionId: '1',
+          clientTabId: 'tab-same',
+          handlers: <String, FutureOr<Object?> Function(Map<String, Object?>)>{
+            'dartpad_get_status': (_) => <String, Object?>{'gen': 'fresh'},
+          },
+        );
+        addTearDown(freshTab.close);
+
+        // Wait for `freshTab`'s `webmcp/hello` to evict `staleTab`, while a
+        // genuinely distinct browser tab (`tab-other`) sharing `s=1` coexists.
+        final distinctTab = await _FakeTab.connect(
+          port: bridge.port,
+          sessionId: '1',
+          clientTabId: 'tab-other',
+          handlers: <String, FutureOr<Object?> Function(Map<String, Object?>)>{
+            'dartpad_get_status': (_) => <String, Object?>{'gen': 'distinct'},
+          },
+        );
+        addTearDown(distinctTab.close);
+        await _waitForConnectedCount(bridge, 2);
+
+        final tabs = (bridge.healthSnapshot()['connectedTabs'] as List<Object?>)
+            .cast<Map<String, Object?>>();
+        final clientIds = <String>[
+          for (final entry in tabs) '${entry['clientTabId']}',
+        ];
+        check(
+          clientIds,
+        ).unorderedEquals(const <String>['tab-same', 'tab-other']);
+
+        // Open a raw TCP socket that completes the HTTP->WebSocket handshake
+        // and sends `webmcp/hello`, then drops all incoming RFC 6455 Ping
+        // frames without replying Pong (simulating a dead SSH tunnel).
+        final rawSocket = await Socket.connect('127.0.0.1', bridge.port);
+        addTearDown(rawSocket.destroy);
+        rawSocket.add(
+          utf8.encode(
+            'GET /mcp-ws HTTP/1.1\r\n'
+            'Host: 127.0.0.1:${bridge.port}\r\n'
+            'Upgrade: websocket\r\n'
+            'Connection: Upgrade\r\n'
+            'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n'
+            'Sec-WebSocket-Version: 13\r\n\r\n',
+          ),
+        );
+        // Drain bytes silently without replying to WebSocket Ping frames.
+        final rawSub = rawSocket.listen((_) {});
+        addTearDown(rawSub.cancel);
+        await Future<void>.delayed(const Duration(milliseconds: 30));
+
+        // Send a masked client text frame announcing `webmcp/hello`.
+        final helloBytes = utf8.encode(
+          jsonEncode(const <String, Object?>{
+            'jsonrpc': '2.0',
+            'method': 'webmcp/hello',
+            'params': <String, Object?>{
+              'sessionId': 'zombie',
+              'clientTabId': 'tab-dead',
+              'url': 'https://preview.dartpad.dev/?s=zombie',
+              'tools': <Object?>[],
+            },
+          }),
+        );
+        final header = <int>[
+          0x81,
+          if (helloBytes.length < 126)
+            0x80 | helloBytes.length
+          else ...<int>[
+            0x80 | 126,
+            (helloBytes.length >> 8) & 0xFF,
+            helloBytes.length & 0xFF,
+          ],
+          0,
+          0,
+          0,
+          0,
+          ...helloBytes,
+        ];
+        rawSocket.add(header);
+        await _waitForConnectedCount(bridge, 3);
+
+        // Because `rawSocket` never replies with Pong, `pingInterval` (60ms)
+        // automatically closes and evicts `tab-dead` back down to 2 tabs.
+        await _waitForConnectedCount(bridge, 2);
       },
     );
   });
@@ -698,6 +918,192 @@ void main() {
         final pipedExit = await proc.exitCode;
         check(pipedExit).equals(0);
         check(stderrText).not((it) => it.contains('FileSystemException'));
+      },
+    );
+
+    test('emits notifications/tools/list_changed on --stdio and fails over if '
+        'prior port owner exits', () async {
+      // 1. Direct `--stdio` mode: emits `notifications/tools/list_changed`
+      // after `initialize` when a tab connects with updated tool schemas.
+      final directPortFile = File(
+        '${Directory.systemTemp.createTempSync('stdio_direct_').path}/port',
+      );
+      addTearDown(() => directPortFile.parent.deleteSync(recursive: true));
+
+      final directIn = StreamController<List<int>>();
+      addTearDown(directIn.close);
+      final directLines = StreamController<String>();
+      addTearDown(directLines.close);
+      final directOut = _LineNotificationSink(directLines);
+
+      final directFuture = runDartPadMcpCli(
+        <String>['--stdio', '--port', '0', '--port-file', directPortFile.path],
+        input: directIn.stream,
+        out: directOut,
+        err: StringBuffer(),
+      );
+
+      final deadline = DateTime.now().add(const Duration(seconds: 3));
+      var boundPort = 0;
+      while (DateTime.now().isBefore(deadline)) {
+        if (directPortFile.existsSync()) {
+          boundPort =
+              int.tryParse(directPortFile.readAsStringSync().trim()) ?? 0;
+          if (boundPort > 0) {
+            break;
+          }
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      check(boundPort).isGreaterThan(0);
+
+      final lineIter = StreamIterator<String>(directLines.stream);
+      addTearDown(lineIter.cancel);
+
+      directIn.add(
+        utf8.encode(
+          '${jsonEncode(const <String, Object?>{
+            'jsonrpc': '2.0',
+            'id': 1,
+            'method': 'initialize',
+            'params': <String, Object?>{'protocolVersion': '2025-06-18'},
+          })}\n',
+        ),
+      );
+      check(
+        await lineIter.moveNext().timeout(const Duration(seconds: 2)),
+      ).isTrue();
+      final initMsg = jsonDecode(lineIter.current) as Map<String, Object?>;
+      check(initMsg['id']).equals(1);
+
+      final customTab = await _FakeTab.connect(
+        port: boundPort,
+        sessionId: '1',
+        handlers: <String, FutureOr<Object?> Function(Map<String, Object?>)>{
+          'experimental_custom_tool': (_) => const <String, Object?>{},
+        },
+      );
+      addTearDown(customTab.close);
+
+      check(
+        await lineIter.moveNext().timeout(const Duration(seconds: 2)),
+      ).isTrue();
+      final listChangedMsg =
+          jsonDecode(lineIter.current) as Map<String, Object?>;
+      check(
+        listChangedMsg['method'],
+      ).equals('notifications/tools/list_changed');
+
+      await customTab.close();
+      await directIn.close();
+      check(await directFuture).equals(0);
+
+      // 2. Proxy `--stdio` failover mode: start primary bridge on a dedicated
+      // port, attach `--stdio`, close the primary bridge, and verify `--stdio`
+      // seamlessly re-binds the port on the next request.
+      final primary = await DartPadMcpBridge.start(port: 0);
+      final sharedPort = primary.port;
+      addTearDown(primary.close);
+
+      final failoverIn = StreamController<List<int>>();
+      addTearDown(failoverIn.close);
+      final failoverLines = StreamController<String>();
+      addTearDown(failoverLines.close);
+      final failoverErr = StringBuffer();
+
+      final failoverFuture = runDartPadMcpCli(
+        <String>['--stdio', '--port', '$sharedPort'],
+        input: failoverIn.stream,
+        out: _LineNotificationSink(failoverLines),
+        err: failoverErr,
+      );
+      final failoverIter = StreamIterator<String>(failoverLines.stream);
+      addTearDown(failoverIter.cancel);
+
+      // Wait until `init()` logs proxy attachment before sending first ping.
+      final attachDeadline = DateTime.now().add(const Duration(seconds: 3));
+      while (!failoverErr.toString().contains('Forwarding stdio MCP') &&
+          DateTime.now().isBefore(attachDeadline)) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      check(failoverErr.toString()).contains('Forwarding stdio MCP');
+
+      final pingFrame = jsonEncode(const <String, Object?>{
+        'jsonrpc': '2.0',
+        'id': 10,
+        'method': 'ping',
+      });
+      failoverIn.add(utf8.encode('$pingFrame\n'));
+      check(
+        await failoverIter.moveNext().timeout(const Duration(seconds: 2)),
+      ).isTrue();
+      check(
+        (jsonDecode(failoverIter.current) as Map<String, Object?>)['id'],
+      ).equals(10);
+
+      // Kill the primary owner of `sharedPort` and send `tools/list`.
+      await primary.close();
+      final toolsFrame = jsonEncode(const <String, Object?>{
+        'jsonrpc': '2.0',
+        'id': 11,
+        'method': 'tools/list',
+      });
+      failoverIn.add(utf8.encode('$toolsFrame\n'));
+      check(
+        await failoverIter.moveNext().timeout(const Duration(seconds: 3)),
+      ).isTrue();
+      final postFailover =
+          jsonDecode(failoverIter.current) as Map<String, Object?>;
+      check(postFailover['id']).equals(11);
+      check(
+        ((postFailover['result'] as Map<String, Object?>)['tools']
+                as List<Object?>)
+            .length,
+      ).equals(9);
+      check(failoverErr.toString()).contains('re-binding port $sharedPort');
+
+      await failoverIn.close();
+      check(await failoverFuture).equals(0);
+    });
+
+    test(
+      '--detach spawns background bridge, prints JSON info, and reuses active '
+      'port idempotently',
+      () async {
+        final firstOut = StringBuffer();
+        final firstCode = await runDartPadMcpCli(
+          const <String>['--detach', '--port', '0'],
+          out: firstOut,
+          err: StringBuffer(),
+        );
+        check(firstCode).equals(0);
+        final firstJson =
+            jsonDecode(firstOut.toString()) as Map<String, Object?>;
+        final spawnedPid = firstJson['pid'] as int;
+        final spawnedPort = firstJson['port'] as int;
+        addTearDown(() {
+          Process.killPid(spawnedPid);
+        });
+        check(firstJson['ok']).equals(true);
+        check(firstJson['reused']).equals(false);
+        check(spawnedPort).isGreaterThan(0);
+        check(firstJson['executable'] as String).isNotEmpty();
+
+        // Re-running `--detach` on the same port succeeds idempotently with
+        // `reused: true` without spawning a second daemon.
+        final secondOut = StringBuffer();
+        final secondCode = await runDartPadMcpCli(
+          <String>['--detach', '--port', '$spawnedPort'],
+          out: secondOut,
+          err: StringBuffer(),
+        );
+        check(secondCode).equals(0);
+        final secondJson =
+            jsonDecode(secondOut.toString()) as Map<String, Object?>;
+        check(secondJson['ok']).equals(true);
+        check(secondJson['reused']).equals(true);
+        check(secondJson['port']).equals(spawnedPort);
+        check(secondJson['pid']).equals(spawnedPid);
       },
     );
   });

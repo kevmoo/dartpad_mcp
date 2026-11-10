@@ -15,6 +15,14 @@ dependencies):
 dart run 'dartpad_mcp@{git: https://github.com/kevmoo/dartpad_mcp}'
 ```
 
+To launch it detached in the background and print JSON containing the bound
+`port`, `pid`, and cached AOT `executable` path (for fast `~15ms` CLI
+subcommands):
+
+```bash
+dart run 'dartpad_mcp@{git: https://github.com/kevmoo/dartpad_mcp}' --detach
+```
+
 Or install it as a native `dartpad_mcp` executable:
 
 ```bash
@@ -57,8 +65,9 @@ claude mcp add --transport http dartpad http://127.0.0.1:8787/mcp
 
 ### Stdio (`--stdio`)
 
-`--stdio` binds `:8787` when no bridge is running yet, and automatically
-attaches to `http://127.0.0.1:8787/mcp` if a daemon is already active:
+`--stdio` binds `:8787` when no bridge is running yet, automatically attaches to
+`http://127.0.0.1:8787/mcp` if a daemon is already active, and seamlessly
+re-binds `:8787` if the prior owner exits:
 
 ```json
 {
