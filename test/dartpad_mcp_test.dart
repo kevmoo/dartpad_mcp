@@ -226,14 +226,14 @@ void main() {
       check(defaultCfg.subcommand).equals(BridgeSubcommand.serve);
       check(defaultCfg.port).equals(defaultBridgePort);
       check(defaultCfg.host).equals('localhost');
-      check(defaultCfg.detach).isFalse();
-      check(defaultCfg.stdio).isFalse();
+      check(defaultCfg.detach).isFalse;
+      check(defaultCfg.stdio).isFalse;
 
       final detachedCfg = parseBridgeCliArgs(const <String>[
         '--detach',
         '--port=0',
       ]);
-      check(detachedCfg.detach).isTrue();
+      check(detachedCfg.detach).isTrue;
       check(detachedCfg.port).equals(0);
 
       final custom = parseBridgeCliArgs(const <String>[
@@ -247,7 +247,7 @@ void main() {
       ]);
       check(custom.port).equals(9123);
       check(custom.host).equals('127.0.0.1');
-      check(custom.stdio).isTrue();
+      check(custom.stdio).isTrue;
       check(custom.waitTimeout).equals(const Duration(milliseconds: 3500));
     });
 
@@ -274,9 +274,9 @@ void main() {
         '--',
         'dartpad_write_files',
       ]);
-      check(stdinCall.useStdinArgs).isTrue();
+      check(stdinCall.useStdinArgs).isTrue;
       check(stdinCall.toolName).equals('dartpad_write_files');
-      check(stdinCall.rawJsonArgs).isNull();
+      check(stdinCall.rawJsonArgs).isNull;
     });
 
     test('rejects unknown flags and invalid values with CliUsageException', () {
@@ -303,7 +303,7 @@ void main() {
       check(
         aotUnix.executable,
       ).equals('/opt/dart/app-bundles/dartpad_mcp/bin/dartpad_mcp');
-      check(aotUnix.prefixArgs).isEmpty();
+      check(aotUnix.prefixArgs).isEmpty;
 
       final aotWin = resolveSelfInvocation(
         resolvedExecutable: r'C:\Users\dev\Dart\install\bin\dartpad_mcp.exe',
@@ -312,7 +312,7 @@ void main() {
       check(
         aotWin.executable,
       ).equals(r'C:\Users\dev\Dart\install\bin\dartpad_mcp.exe');
-      check(aotWin.prefixArgs).isEmpty();
+      check(aotWin.prefixArgs).isEmpty;
 
       final jitScript = resolveSelfInvocation(
         resolvedExecutable: '/sdk/bin/dart',
@@ -415,7 +415,7 @@ void main() {
           'jsonrpc': '2.0',
           'method': 'notifications/initialized',
         });
-        check(notifResp).isNull();
+        check(notifResp).isNull;
 
         // Start a tool call BEFORE any browser tab has connected.
         final coldCallFuture = postMcpHttp(mcpUri, const <String, Object?>{
@@ -535,7 +535,7 @@ void main() {
         final tools =
             (cachedList['result'] as Map<String, Object?>)['tools']
                 as List<Object?>;
-        check(tools).isNotEmpty();
+        check(tools).isNotEmpty;
       },
     );
 
@@ -917,7 +917,7 @@ void main() {
         final stderrText = await utf8.decoder.bind(proc.stderr).join();
         final pipedExit = await proc.exitCode;
         check(pipedExit).equals(0);
-        check(stderrText).not((it) => it.contains('FileSystemException'));
+        check(stderrText).not(.it()..contains('FileSystemException'));
       },
     );
 
@@ -972,7 +972,7 @@ void main() {
       );
       check(
         await lineIter.moveNext().timeout(const Duration(seconds: 2)),
-      ).isTrue();
+      ).isTrue;
       final initMsg = jsonDecode(lineIter.current) as Map<String, Object?>;
       check(initMsg['id']).equals(1);
 
@@ -987,7 +987,7 @@ void main() {
 
       check(
         await lineIter.moveNext().timeout(const Duration(seconds: 2)),
-      ).isTrue();
+      ).isTrue;
       final listChangedMsg =
           jsonDecode(lineIter.current) as Map<String, Object?>;
       check(
@@ -1036,7 +1036,7 @@ void main() {
       failoverIn.add(utf8.encode('$pingFrame\n'));
       check(
         await failoverIter.moveNext().timeout(const Duration(seconds: 2)),
-      ).isTrue();
+      ).isTrue;
       check(
         (jsonDecode(failoverIter.current) as Map<String, Object?>)['id'],
       ).equals(10);
@@ -1051,7 +1051,7 @@ void main() {
       failoverIn.add(utf8.encode('$toolsFrame\n'));
       check(
         await failoverIter.moveNext().timeout(const Duration(seconds: 3)),
-      ).isTrue();
+      ).isTrue;
       final postFailover =
           jsonDecode(failoverIter.current) as Map<String, Object?>;
       check(postFailover['id']).equals(11);
@@ -1087,7 +1087,7 @@ void main() {
         check(firstJson['ok']).equals(true);
         check(firstJson['reused']).equals(false);
         check(spawnedPort).isGreaterThan(0);
-        check(firstJson['executable'] as String).isNotEmpty();
+        check(firstJson['executable'] as String).isNotEmpty;
 
         // Re-running `--detach` on the same port succeeds idempotently with
         // `reused: true` without spawning a second daemon.
